@@ -3,8 +3,8 @@
 # Platform SSO Enforcement (of) User Device Onboarding
 # https://github.com/Macjutsu/pseudo
 # by Kevin M. White
-# edited by Mario Alletto for Zilch Technology March 2026
-# Okta-only build — all Microsoft Entra/Company Portal and Workspace One references removed.
+# Modified: by Mario Alletto for Zilch Technology March 2026
+# Added a reboot step for Desktop MFA registration and made the dialog box moveable.
 
 # The next line disables specific ShellCheck codes (https://github.com/koalaman/shellcheck) for the entire script.
 # shellcheck disable=SC2012,SC2024,SC2207
@@ -436,6 +436,7 @@ open_dialog_touch_id_required() {
 		--message "**Touch ID is required for all Mac computers at ${DISPLAY_ORGANIZATION_NAME}.**<br><br>Touch ID provides enhanced security and convenience by allowing you to authenticate using the Mac computer's fingerprint sensor." \
 		--icon "SF=touchid,colour=auto" \
 		--small \
+        --moveable \
 		--position "${DISPLAY_DIALOG_POSITION}" \
 		--timer "${TIMEOUT_DEFAULT_SECONDS}" \
 		--hidetimerbar \
@@ -458,6 +459,7 @@ open_dialog_touch_id_optional() {
 		--position "${DISPLAY_DIALOG_POSITION}" \
 		--timer "${TIMEOUT_DEFAULT_SECONDS}" \
 		--hidetimerbar \
+        --moveable \
 		--button1text "Enable Touch ID" \
 		--button2text "Skip" \
 		--quitkey p \
@@ -474,6 +476,7 @@ open_dialog_touch_id_start() {
 		--message "Enable Touch ID by adding at least one fingerprint in the Touch ID settings." \
 		--icon "SF=touchid,colour=auto" \
 		--mini \
+        --moveable \
 		--position "${DISPLAY_DIALOG_POSITION}" \
 		--button1text none \
 		--quitkey p \
@@ -491,6 +494,7 @@ open_dialog_touch_id_success() {
 		--message "Thank you for enabling Touch ID! You can register additional fingerprints or click \"OK\" to close the Touch ID settings." \
 		--icon "SF=touchid,colour=auto" \
 		--mini \
+        --moveable \
 		--position "${DISPLAY_DIALOG_POSITION}" \
 		--button1text "OK" \
 		--quitkey p \
@@ -657,10 +661,35 @@ EOAS
 	echo "${psso_registration_active_result}"
 }
 
+# CHANGED: Replaced open_psso_registration() with multi-method approach for macOS Tahoe compatibility.
+# Method 1: Direct trigger via app-sso platform -a (programmatic, bypasses Notification Centre).
+# Method 2: Notification Centre click with broadened text matching and diagnostic logging.
 open_psso_registration() {
 	killall "AppSSOAgent" > /dev/null 2>&1
+	sleep 0.5
+
+	# ── Method 1: Direct trigger via app-sso platform -a ──────────────────────
+	log_pseudo "Status: Trying direct PSSO registration trigger (app-sso platform -a)..."
+	run_as_user app-sso platform -a > /dev/null 2>&1 &
+	local cmd_pid=$!
+	local wait_count=0
+	while [[ $wait_count -lt 8 ]]; do
+		sleep 1
+		((wait_count++))
+		if [[ "$(check_psso_registration_active)" == "TRUE" ]]; then
+			kill "${cmd_pid}" 2>/dev/null; wait "${cmd_pid}" 2>/dev/null
+			log_pseudo "Status: PSSO registration window opened via app-sso platform -a."
+			echo "TRUE"
+			return 0
+		fi
+	done
+	kill "${cmd_pid}" 2>/dev/null; wait "${cmd_pid}" 2>/dev/null
+	log_pseudo "Warning: app-sso platform -a did not produce a registration window."
+
+	# ── Method 2: app-sso -l then Notification Centre click ───────────────────
+	log_pseudo "Status: Trying Notification Centre approach (app-sso -l)..."
 	run_as_user app-sso -l > /dev/null 2>&1
-	sleep 1
+	sleep 2
 	local open_psso_registration_result
 	open_psso_registration_result=$(osascript <<EOAS
 tell application "System Events"
@@ -679,21 +708,32 @@ tell application "System Events"
 		end tell
 	end tell
 	delay 1
-	tell application process "NotificationCenter"
-		set allElements to entire contents of window 1
-	end tell
 	set foundElement to false
-	repeat with aElement in allElements
-		set aElementStaticTexts to static texts of aElement
-		repeat with aStaticText in aElementStaticTexts
-			if (name of aStaticText contains "Registration Required") then
-				set foundElement to true
-				set pssoElement to aElement
-				exit repeat
-			end if
+	set ncDebug to ""
+	try
+		tell application process "NotificationCenter"
+			set allElements to entire contents of window 1
+		end tell
+		repeat with aElement in allElements
+			set aElementStaticTexts to static texts of aElement
+			repeat with aStaticText in aElementStaticTexts
+				set sName to name of aStaticText
+				set ncDebug to ncDebug & "|" & sName
+				if (sName contains "Registration Required") or ¬
+				   (sName contains "Registration required") or ¬
+				   (sName contains "registration") or ¬
+				   (sName contains "Platform SSO") or ¬
+				   (sName contains "Single Sign") then
+					set foundElement to true
+					set pssoElement to aElement
+					exit repeat
+				end if
+			end repeat
+			if (foundElement) then exit repeat
 		end repeat
-		if (foundElement) then exit repeat
-	end repeat
+	on error errMsg
+		set ncDebug to "ERROR: " & errMsg
+	end try
 	if foundElement then
 		tell pssoElement
 			click
@@ -710,12 +750,24 @@ tell application "System Events"
 				click
 			end tell
 		end tell
-		return "FALSE"
+		return "FALSE:" & ncDebug
 	end if
 end tell
 EOAS
 	)
-	echo "${open_psso_registration_result}"
+
+	# Parse result — log diagnostic NC contents on failure.
+	if [[ "${open_psso_registration_result}" == FALSE* ]]; then
+		local nc_elements="${open_psso_registration_result#FALSE:}"
+		if [[ -n "${nc_elements}" ]]; then
+			log_pseudo "Warning: No PSSO notification found. NC elements: ${nc_elements}"
+		else
+			log_pseudo "Warning: No PSSO notification found in Notification Centre (empty or inaccessible)."
+		fi
+		echo "FALSE"
+	else
+		echo "${open_psso_registration_result}"
+	fi
 }
 
 focus_psso_registration() {
@@ -763,6 +815,7 @@ open_dialog_psso_start() {
 		--message "**Platform SSO is required for all Mac computers at ${DISPLAY_ORGANIZATION_NAME}.**<br><br>Please click the \"Continue\" button to sign in and register with Platform SSO." \
 		--icon "${psso_dialog_icon}" \
 		--small \
+        --moveable \
 		--position "${DISPLAY_DIALOG_POSITION}" \
 		--button1text none \
 		--quitkey p \
@@ -780,6 +833,7 @@ open_dialog_psso_success() {
 		--message "Thank you for registering Platform SSO! Click \"OK\" to close this dialog." \
 		--icon "${psso_dialog_icon}" \
 		--mini \
+        --moveable \
 		--position "${DISPLAY_DIALOG_POSITION}" \
 		--button1text "OK" \
 		--quitkey p \
@@ -796,6 +850,7 @@ open_dialog_psso_restart_countdown() {
 		--title "Restart Required" \
 		--message "**Platform SSO registration is complete.**\n\nYour Mac must restart to finish device setup.\n\nThe computer will automatically restart in **10 minutes**.\n\nPlease save any open work." \
 		--markdown \
+        --moveable \
 		--icon "${psso_dialog_icon}" \
 		--position "${DISPLAY_DIALOG_POSITION}" \
 		--timer 600 \
@@ -841,11 +896,12 @@ workflow_psso() {
 	fi
 
 	# --- Phase 1: User-facing interactive registration. ---
-	# Only runs if the dscl entry is missing (user has never completed auth).
-	# Uses the lightweight dscl-only check — no app-sso calls in this loop.
+	# CHANGED: Removed hard exit_error on open_psso_registration failure.
+	# Script now logs a warning and retries via the grace-period mechanism every
+	# PSSO_REOPEN_GRACE_SECONDS, allowing all open methods multiple attempts
+	# across the full TIMEOUT_DEFAULT_SECONDS window.
 	local workflow_psso_timer=0
 	psso_workflow_active="FALSE"
-	local psso_registration_opened="FALSE"
 	local psso_window_closed_seconds=0
 
 	while [[ "${psso_user_status_dscl}" == "FALSE" ]]; do
@@ -858,11 +914,11 @@ workflow_psso() {
 
 			if [[ "$(check_psso_registration_active)" == "FALSE" ]]; then
 				log_pseudo "Status: Attempting to open Platform SSO registration..."
-				[[ "$(open_psso_registration)" == "FALSE" ]] && log_pseudo "Exit: Unable to open Platform SSO registration." && exit_error
-				psso_registration_opened="TRUE"
+				if [[ "$(open_psso_registration)" == "FALSE" ]]; then
+					log_pseudo "Warning: Unable to open PSSO registration on initial attempt. Will retry via grace period..."
+				fi
 			else
 				log_pseudo "Status: Platform SSO registration is already open."
-				psso_registration_opened="TRUE"
 			fi
 
 			open_dialog_psso_start
@@ -872,26 +928,19 @@ workflow_psso() {
 		# Monitor the registration window.
 		if [[ "$(check_psso_registration_active)" == "TRUE" ]]; then
 			psso_window_closed_seconds=0
-			psso_registration_opened="TRUE"
 			focus_psso_registration
 		else
-			if [[ "${psso_registration_opened}" == "TRUE" ]]; then
-				((psso_window_closed_seconds++))
-				[[ $psso_window_closed_seconds -eq 1 ]] && log_pseudo "Status: Platform SSO registration window closed. Waiting up to ${PSSO_REOPEN_GRACE_SECONDS}s for background registration to complete..."
+			((psso_window_closed_seconds++))
+			[[ $psso_window_closed_seconds -eq 1 ]] && log_pseudo "Status: PSSO registration window not active. Waiting up to ${PSSO_REOPEN_GRACE_SECONDS}s before retrying..."
 
-				if [[ $psso_window_closed_seconds -ge $PSSO_REOPEN_GRACE_SECONDS ]]; then
-					psso_window_closed_seconds=0
-					log_pseudo "Status: Grace period expired. Attempting to re-open Platform SSO registration..."
-					if [[ "$(open_psso_registration)" == "FALSE" ]]; then
-						log_pseudo "Warning: Unable to re-open Platform SSO registration via notification. Continuing to poll dscl..."
-					else
-						log_pseudo "Status: Successfully re-opened Platform SSO registration."
-					fi
+			if [[ $psso_window_closed_seconds -ge $PSSO_REOPEN_GRACE_SECONDS ]]; then
+				psso_window_closed_seconds=0
+				log_pseudo "Status: Grace period expired. Attempting to re-open Platform SSO registration..."
+				if [[ "$(open_psso_registration)" == "FALSE" ]]; then
+					log_pseudo "Warning: Unable to re-open PSSO registration. Continuing to poll dscl..."
+				else
+					log_pseudo "Status: Successfully re-opened Platform SSO registration."
 				fi
-			else
-				log_pseudo "Status: Attempting to open Platform SSO registration..."
-				[[ "$(open_psso_registration)" == "FALSE" ]] && log_pseudo "Exit: Unable to open Platform SSO registration." && exit_error
-				psso_registration_opened="TRUE"
 			fi
 		fi
 
